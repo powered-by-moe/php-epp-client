@@ -224,6 +224,11 @@ class eppConnection {
         if (!$settingsfile) {
             $settingsfile = 'settings.ini';
         }
+        $test = pathinfo($settingsfile);
+        if ($test['dirname']!='.') {
+            $path = $test['dirname'];
+            $settingsfile=$test['basename'];
+        }
         if ($settings = $this->loadSettings($path,$settingsfile)) {
             $this->setHostname($settings['hostname']);
             $this->setUsername($settings['userid']);
@@ -282,6 +287,7 @@ class eppConnection {
 
     public function enableRgp() {
         $this->addExtension('rgp','urn:ietf:params:xml:ns:rgp-1.0');
+        $this->responses['Metaregistrar\\EPP\\eppRgpRestoreRequest'] = 'Metaregistrar\\EPP\\eppRgpRestoreResponse';
     }
 
     public function disableRgp() {
@@ -319,11 +325,12 @@ class eppConnection {
     public function disconnect() {
         if (is_resource($this->connection)) {
             //echo "Fclosing $this->hostname\n";
-            @ob_flush();
+            //@ob_flush();
             fclose($this->connection);
             $this->writeLog("Disconnected","DISCONNECT");
-            $this->connected = false;
         }
+        $this->connected = false;
+        $this->loggedin = false;
         return true;
     }
 
@@ -333,7 +340,6 @@ class eppConnection {
      * @param int $port
      * @return bool
      * @throws eppException
-     * @internal param string $address
      */
     public function connect($hostname = null, $port = null) {
         if ($hostname) {
@@ -365,14 +371,14 @@ class eppConnection {
             }
         } else {
             //We don't want our error handler to kick in at this point...
-            putenv('SURPRESS_ERROR_HANDLER=1');
+            //putenv('SURPRESS_ERROR_HANDLER=1');
             #echo "Connecting: $this->hostname:$this->port\n";
             #$this->writeLog("Connecting: $this->hostname:$this->port");
             $context = stream_context_create();
             stream_context_set_option($context, 'ssl','verify_peer',false);
             stream_context_set_option($context, 'ssl','verify_peer_name',false);
             $this->connection = stream_socket_client($this->hostname.':'.$this->port, $errno, $errstr, $this->timeout, STREAM_CLIENT_CONNECT, $context);
-            putenv('SURPRESS_ERROR_HANDLER=0');
+            //putenv('SURPRESS_ERROR_HANDLER=0');
             if (is_resource($this->connection)) {
                 stream_set_blocking($this->connection, false);
                 stream_set_timeout($this->connection, $this->timeout);
@@ -455,18 +461,20 @@ class eppConnection {
      * @throws eppException
      */
     public function read($nonBlocking=false) {
-        putenv('SURPRESS_ERROR_HANDLER=1');
+        //putenv('SURPRESS_ERROR_HANDLER=1');
         $content = '';
         $time = time() + $this->timeout;
         $read = "";
         while ((!isset ($length)) || ($length > 0)) {
             if (feof($this->connection)) {
-                putenv('SURPRESS_ERROR_HANDLER=0');
+                //putenv('SURPRESS_ERROR_HANDLER=0');
+                $this->loggedin = false;
+                $this->connected = false;
                 throw new eppException ('Unexpected closed connection by remote host...',0,null,null,$read);
             }
             //Check if timeout occured
             if (time() >= $time) {
-                putenv('SURPRESS_ERROR_HANDLER=0');
+                //putenv('SURPRESS_ERROR_HANDLER=0');
                 return false;
             }
             //If we dont know how much to read we read the first few bytes first, these contain the content-length
@@ -483,13 +491,13 @@ class eppConnection {
                     }
                     //Check if timeout occured
                     if (time() >= $time) {
-                        putenv('SURPRESS_ERROR_HANDLER=0');
+                        //putenv('SURPRESS_ERROR_HANDLER=0');
                         return false;
                     }
                 }
                 //$this->writeLog("Read 4 bytes for integer. (read: " . strlen($read) . "):$read","READ");
                 $length = $this->readInteger($read) - 4;
-                $this->writeLog("Reading next: $length bytes","READ");
+                //$this->writeLog("Reading next: $length bytes","READ");
             }
             if ($length > 1000000) {
                 throw new eppException("Packet size is too big: $length. Closing connection",0,null,null,$read);
@@ -519,7 +527,7 @@ class eppConnection {
             }
 
         }
-        putenv('SURPRESS_ERROR_HANDLER=0');
+        //putenv('SURPRESS_ERROR_HANDLER=0');
         #ob_flush();
         return $content;
     }
@@ -553,20 +561,22 @@ class eppConnection {
      * @throws eppException
      */
     public function write($content) {
-        $this->writeLog("Writing: " . strlen($content) . " + 4 bytes","WRITE");
+        //$this->writeLog("Writing: " . strlen($content) . " + 4 bytes","WRITE");
         $content = $this->addInteger($content);
         if (!is_resource($this->connection)) {
+            $this->connected = false;
+            $this->loggedin = false;
             throw new eppException ('Writing while no connection is made is not supported.');
         }
 
-        putenv('SURPRESS_ERROR_HANDLER=1');
+        //putenv('SURPRESS_ERROR_HANDLER=1');
         #ob_flush();
         if (fwrite($this->connection, $content)) {
             //fpassthru($this->connection);
-            putenv('SURPRESS_ERROR_HANDLER=0');
+            //putenv('SURPRESS_ERROR_HANDLER=0');
             return true;
         }
-        putenv('SURPRESS_ERROR_HANDLER=0');
+        //putenv('SURPRESS_ERROR_HANDLER=0');
         return false;
     }
 
@@ -664,6 +674,25 @@ class eppConnection {
     }
 
     /**
+     * Error handler for loadxml() so that a nice exception is thrown
+     * @param int $errno
+     * @param string $errstr
+     * @param string $errfile
+     * @param string $errline
+     * @return bool
+     * @throws eppException
+     */
+    function HandleXmlError($errno, $errstr, $errfile, $errline)
+    {
+        if ($errno==E_WARNING && (substr_count($errstr,"DOMDocument::loadXML()")>0))
+        {
+            throw new eppException('ERROR reading EPP message: '.str_replace('DOMDocument::loadXML(): ','',$errstr),$errno, null, $errfile.'('.$errline.')');
+        }
+        else
+            return false;
+    }
+
+    /**
      * Write the content domDocument to the stream
      * Read the answer
      * Load the answer in a response domDocument
@@ -729,7 +758,9 @@ class eppConnection {
             }
 
             if (strlen($xml)) {
+                set_error_handler(array($this,'HandleXmlError'));
                 if ($response->loadXML($xml)) {
+                    restore_error_handler();
                     $this->writeLog($response->saveXML(null, LIBXML_NOEMPTYTAG),"READ");
                     /*
                     ob_flush();
@@ -746,8 +777,11 @@ class eppConnection {
                         $response->validateServices($this->getLanguage(), $this->getVersion());
                     }
                     return $response;
+                } else {
+                    restore_error_handler();
                 }
             } else {
+
                 throw new eppException('Empty XML document when receiving data!');
             }
         } else {
@@ -984,6 +1018,9 @@ class eppConnection {
             if (array_key_exists('certificatefile',$result) && array_key_exists('certificatepassword',$result)) {
                 // Enter the path to your certificate and the password here
                 $this->enableCertification($result['certificatefile'], $result['certificatepassword']);
+            } elseif (array_key_exists('certificatefile',$result)) {
+		// Enter the path to your certificate without password
+                $this->enableCertification($result['certificatefile'], null);
             }
             return true;
         } else {
@@ -1004,6 +1041,22 @@ class eppConnection {
             return $result;
         }
         return null;
+    }
+
+    /**
+     * Returns if the session is still open
+     * @return bool
+     */
+    public function isConnected() {
+        return $this->connected;
+    }
+
+    /**
+     * Return if the system is still logged in
+     * @return bool
+     */
+    public function isLoggedin() {
+        return $this->loggedin;
     }
 
     private function showLog() {
